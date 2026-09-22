@@ -142,3 +142,104 @@ def save_check_result(site: str, result: dict):
         "ErrorMotive": result["error_motive"]
     }
     table.upsert_entity(entity)
+
+def get_uptime_stats():
+    connection_string = os.environ.get("STORAGE_CONNECTION_STRING", "")
+    table_service = TableServiceClient.from_connection_string(conn_str=connection_string)
+    table_client = table_service.get_table_client("WebsiteChecks")
+    contadores = {}
+    operational_cont = {}
+    uptime = {}
+    partition_keys = set()
+
+    entities = list(table_client.list_entities())
+
+    for entity in entities:
+        partition_key = entity["PartitionKey"]
+
+        if partition_key not in contadores:
+            contadores[partition_key] = 0
+            operational_cont[partition_key] = 0
+            partition_keys.add(partition_key)
+
+        contadores[partition_key] += 1
+
+        status = entity["Status"]
+        if status == "OPERATIONAL":
+            operational_cont[partition_key] +=1
+    
+    for partition_key in partition_keys:
+        uptime_ = (operational_cont[partition_key]/contadores[partition_key]) * 100
+        uptime[partition_key] = uptime_
+
+    return uptime
+
+@app.route(route="uptime_stats", auth_level=func.AuthLevel.ANONYMOUS)
+def uptime_stats_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    result = get_uptime_stats()
+    return func.HttpResponse(body=json.dumps(result), status_code=200, mimetype="application/json")
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <title>Website Uptime Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; }
+        h1 { text-align: center; }
+    </style>
+</head>
+<body>
+    <h1>Website Uptime Dashboard</h1>
+    <div style="position: relative;">
+    <canvas id="uptimeChart"></canvas>
+    </div>
+
+    <script>
+        fetch('/api/uptime_stats')
+            .then(response => response.json())
+            .then(data => {
+                const labels = Object.keys(data);
+                const values = Object.values(data);
+
+                // Ajusta a altura do canvas dinamicamente: mais sites = mais altura
+                const canvas = document.getElementById('uptimeChart');
+                canvas.parentNode.style.height = Math.max(300, labels.length * 50) + 'px';
+
+                new Chart(canvas, {
+                    type: 'bar',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Uptime (%)',
+                            data: values,
+                            backgroundColor: values.map(v => v >= 90 ? '#4CAF50' : v >= 50 ? '#FFC107' : '#F44336')
+                        }]
+                    },
+                    options: {
+                        indexAxis: 'y',
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                onClick: null,  // desativa o clique na legenda
+                                labels: {
+                                color: '#4CAF50'
+                                }
+                            }
+                        },
+                        scales: {
+                            x: { beginAtZero: true, max: 100 }
+                        }
+                    }
+                });
+            });
+    </script>
+</body>
+</html>
+"""
+
+@app.route(route="dashboard", auth_level=func.AuthLevel.ANONYMOUS)
+def dashboard(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(body=DASHBOARD_HTML, status_code=200, mimetype="text/html")
