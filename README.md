@@ -11,6 +11,9 @@ Projeto desenvolvido para aprender e demonstrar conceitos fundamentais de **Azur
 - [Visão geral](#visão-geral)
 - [Arquitetura](#arquitetura)
 - [Como funciona](#como-funciona)
+- [Dashboard de uptime](#dashboard-de-uptime)
+- [Testes automatizados](#testes-automatizados)
+- [CI/CD](#cicd)
 - [Recursos de Azure utilizados](#recursos-de-azure-utilizados)
 - [Setup — correr localmente](#setup--correr-localmente)
 - [Deploy para o Azure](#deploy-para-o-azure)
@@ -28,10 +31,12 @@ O projeto tem duas funções principais que trabalham em conjunto:
 
 | Função | Tipo de Trigger | Responsabilidade |
 |---|---|---|
-| `check_website` | HTTP Trigger | Recebe um URL por parâmetro, verifica se o site está online e devolve o resultado em JSON |
+| `check_website` | HTTP Trigger (autenticado) | Recebe um URL por parâmetro, verifica se o site está online e devolve o resultado em JSON |
 | `monitor_websites` | Timer Trigger (cron) | Corre automaticamente a cada 5 minutos, chama `check_website` para uma lista de sites configurável, e persiste cada resultado numa tabela |
+| `uptime_stats_endpoint` | HTTP Trigger (anónimo) | Lê o histórico da tabela e calcula a % de uptime de cada site monitorizado |
+| `dashboard` | HTTP Trigger (anónimo) | Devolve uma página HTML com um gráfico de barras interativo, mostrando a % de uptime de cada site |
 
-Não é preciso nenhuma intervenção manual — depois de configurado, o sistema monitoriza os sites sozinho, 24/7, e guarda um histórico consultável de disponibilidade ao longo do tempo.
+Não é preciso nenhuma intervenção manual — depois de configurado, o sistema monitoriza os sites sozinho, 24/7, guarda um histórico consultável de disponibilidade, e expõe uma dashboard visual para consulta rápida. Testes automatizados e integração contínua garantem que qualquer alteração ao código é validada antes de chegar a produção.
 
 ## Arquitetura
 
@@ -53,6 +58,22 @@ sequenceDiagram
         Monitor->>Table: guarda resultado (upsert_entity)
         Monitor->>Insights: regista log (sucesso/aviso/erro)
     end
+```
+
+```mermaid
+sequenceDiagram
+    participant Browser as Browser (utilizador)
+    participant Dash as dashboard<br/>(HTTP Trigger)
+    participant Stats as uptime_stats_endpoint<br/>(HTTP Trigger)
+    participant Table as Azure Table Storage
+
+    Browser->>Dash: GET /api/dashboard
+    Dash-->>Browser: página HTML + Chart.js
+    Browser->>Stats: fetch('/api/uptime_stats')
+    Stats->>Table: list_entities() — lê todo o histórico
+    Table-->>Stats: entidades (Status por site)
+    Stats-->>Browser: JSON { "site.com": 99.5, ... }
+    Browser->>Browser: desenha gráfico de barras horizontais
 ```
 
 Todos os recursos vivem no mesmo **Resource Group**, na região Belgium Central:
@@ -122,6 +143,51 @@ traces
 
 ![Logs de execução no Application Insights](screenshots/application-insights-logs.png)
 
+## Dashboard de uptime
+
+Endpoint público (`/api/dashboard`) que mostra a % de uptime de cada site monitorizado num gráfico de barras horizontais interativo:
+
+```
+GET /api/dashboard
+```
+
+- Gráfico gerado com **Chart.js** (carregado via CDN, sem dependências locais)
+- Cores condicionais por barra: verde (≥90%), amarelo (≥50%), vermelho (<50%)
+- Barras horizontais, com altura do gráfico ajustada dinamicamente ao número de sites — escala bem mesmo com muitos sites monitorizados, sem sobrepor ou cortar labels
+- Consome os dados de `/api/uptime_stats` via `fetch()`, no lado do browser
+
+O cálculo da % de uptime é feito a partir do histórico completo guardado na tabela `WebsiteChecks`:
+
+```
+uptime % = (nº de registos com Status "OPERATIONAL") / (nº total de registos) × 100
+```
+
+Ambos os endpoints (`uptime_stats_endpoint` e `dashboard`) são **anónimos** (sem function key) — deliberadamente, porque a key nunca poderia ficar protegida dentro de JavaScript correndo no browser (qualquer pessoa veria o código-fonte da página). Ao contrário de `check_website`, estes endpoints só leem dados agregados e não têm custo/risco por chamada, por isso não precisam da mesma proteção.
+
+## Testes automatizados
+
+O projeto tem uma suite de testes com **pytest**, cobrindo as funções principais de lógica de negócio:
+
+- `normalize_url`, `sanitize_partition_key`, `is_valid_url` — testados diretamente, sem mocks (são funções puras, sem I/O)
+- `perform_check` — testado com **mocking** de `requests.get` (via `unittest.mock`), cobrindo os casos: site operacional (200), site em baixo (404) e erro de conexão (`ConnectionError`)
+
+O uso de mocks é uma escolha deliberada: evita que os testes dependam de sites externos reais estarem disponíveis, torna a suite rápida (~1 segundo, sem pedidos de rede) e reprodutível em qualquer ambiente, incluindo CI.
+
+Correr os testes localmente:
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+## CI/CD
+
+Um workflow de **GitHub Actions** (`.github/workflows/tests.yml`) corre a suite de testes automaticamente:
+
+- Em cada `push` para `main`
+- Em cada `pull_request` contra `main`
+
+Isto garante que qualquer alteração ao código é validada antes de ser integrada, sem depender de correr os testes manualmente. O workflow usa uma máquina Ubuntu temporária, instala Python 3.11 e as dependências (`requirements.txt` + `requirements-dev.txt`), e corre `pytest -v`.
+
 ## Recursos de Azure utilizados
 
 - **Azure Functions** (Python, plano de Consumo, Linux)
@@ -152,6 +218,9 @@ python -m venv .venv
 
 # Instalar dependências
 pip install -r requirements.txt
+
+# (Opcional) Instalar dependências de desenvolvimento, para correr os testes
+pip install -r requirements-dev.txt
 ```
 
 Cria um ficheiro `local.settings.json` na raiz do projeto (**não é versionado no Git**, contém segredos):
@@ -252,9 +321,10 @@ Site em baixo / URL inexistente:
 ## Possíveis melhorias futuras
 
 - Alertas automáticos (email/Teams/Slack) quando um site fica `DOWN`
-- Dashboard de visualização do histórico (ex: gráfico de uptime % por site)
 - Suporte a verificações mais avançadas (certificados SSL a expirar, tempo de resposta acima de um limite, etc.)
-- Testes automatizados (unitários para `perform_check`, `normalize_url`, `is_valid_url`)
+- Filtro por período na dashboard (ex: uptime dos últimos 7 dias, em vez de todo o histórico)
+- Testes para `check_website` e `monitor_websites` (atualmente só `perform_check` e as funções auxiliares têm cobertura direta)
+- Deploy automático para o Azure via GitHub Actions (atualmente o workflow só corre testes, o deploy continua manual via `func azure functionapp publish`)
 
 ## Tecnologias utilizadas
 
@@ -262,6 +332,9 @@ Site em baixo / URL inexistente:
 - **Azure Functions** (HTTP Trigger + Timer Trigger)
 - **Azure Table Storage** (`azure-data-tables`)
 - **Application Insights** (logging e queries KQL)
+- **Chart.js** (visualização de dados na dashboard)
+- **pytest** + **unittest.mock** (testes automatizados)
+- **GitHub Actions** (CI/CD)
 - **Azure CLI** / **Azure Functions Core Tools**
 - **Azurite** (emulação local de storage para desenvolvimento)
 
